@@ -3,17 +3,22 @@
 
 from __future__ import annotations
 
+import contextlib
 import getpass
+import http.server
+import io
 import math
 import os
 import platform
 import re
 import shutil
+import signal
 import socket
-import stat
+import socketserver
 import sys
-import time
+import threading
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Any, Callable
 
 UNKNOWN = "Unknown / Not exposed"
@@ -480,10 +485,12 @@ def run_collector(name: str, collector: Callable[[], None]) -> None:
         item("Collector status", UNKNOWN)
 
 
-def main() -> int:
-    try:
+def build_inspection_report() -> str:
+    """Run the inspection once and return the complete report for stdout and HTTP."""
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
         print("SYSTEM CONFIGURATION INSPECTOR")
-        print("Read-only inspection using Python standard library; no API, server, telemetry, or network calls.")
+        print("Read-only inspection using Python standard library; no external network calls.")
         if safe_call(platform.system) != "Linux":
             print("Platform notice: Linux-specific files may be unavailable; collecting portable values where possible.")
         cgroup = safe_call(cgroup_info, (UNKNOWN, None, {}, "/"))
@@ -502,10 +509,98 @@ def main() -> int:
         )
         for name, collector in collectors:
             run_collector(name, collector)
-        print("\n[system-config-inspector] Inspection completed successfully.")
+    return output.getvalue()
+
+
+class QuietReportHandler(http.server.BaseHTTPRequestHandler):
+    """Serve the immutable startup report and a minimal health response."""
+
+    report = ""
+
+    def _send(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
+        payload = body.encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def do_GET(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/":
+            self._send(200, self.report)
+        elif path == "/healthz":
+            self._send(200, "ok\n")
+        else:
+            self._send(404, "Not found\n")
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        # Deployment logs should contain the startup report, not one line per request.
+        return
+
+    def do_POST(self) -> None:
+        self._send(405, "Method not allowed\n")
+
+    do_PUT = do_POST
+    do_DELETE = do_POST
+
+
+class InspectorHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def parse_port() -> int:
+    raw = os.environ.get("PORT", "10000").strip()
+    try:
+        port = int(raw)
+        if 1 <= port <= 65535:
+            return port
+    except (TypeError, ValueError):
+        pass
+    print(f"[system-config-inspector] Invalid PORT={raw!r}; using fallback port 10000.")
+    return 10000
+
+
+def serve_report(report: str, port: int) -> None:
+    QuietReportHandler.report = report
+    server = InspectorHTTPServer(("0.0.0.0", port), QuietReportHandler)
+    stopping = {"value": False}
+
+    def shutdown_handler(signum: int, _frame: Any) -> None:
+        if not stopping["value"]:
+            stopping["value"] = True
+            print(f"\n[system-config-inspector] Shutdown signal {signum} received; stopping HTTP server.", flush=True)
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
+    print(f"[system-config-inspector] HTTP server listening on 0.0.0.0:{port}", flush=True)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        server.server_close()
+        print("[system-config-inspector] HTTP server stopped.", flush=True)
+
+
+def main() -> int:
+    try:
+        print("[system-config-inspector] Starting read-only runtime inspection...", flush=True)
+        report = build_inspection_report()
+        completed_report = report + "\n[system-config-inspector] Inspection completed successfully.\n"
+        print(completed_report, end="", flush=True)
+        serve_report(completed_report, parse_port())
         return 0
     except KeyboardInterrupt:
-        print("\n[system-config-inspector] Inspection interrupted.", file=sys.stderr)
+        print("\\n[system-config-inspector] Inspection interrupted; shutting down.", file=sys.stderr)
         return 130
     except Exception as exc:
         print(f"[system-config-inspector] Fatal application failure: {exc}", file=sys.stderr)
