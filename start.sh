@@ -8,4 +8,8 @@ else
   printf '%s\n' "[system-config-inspector] PORT is not set; the HTTP viewer will use fallback port 10000."
 fi
 
-exec python3 "$(dirname "$0")/system_info.py"
+if [[ "${INSPECTOR_MODE:-serve}" == "once" ]]; then
+  exec python3 "$(dirname "$0")/system_info.py" --once
+else
+  exec python3 "$(dirname "$0")/system_info.py" --serve
+fi

@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import datetime
 import getpass
+import html
 import http.server
 import io
 import math
@@ -846,10 +847,101 @@ def build_inspection_report() -> str:
     return output.getvalue()
 
 
+def parse_report(report: str) -> dict[str, Any]:
+    """Convert the human-readable CLI report into the shared GUI data model."""
+    sections: dict[str, list[dict[str, str]]] = {}
+    current = "REPORT"
+    sections[current] = []
+    section_pattern = re.compile(r"^=+\s+(.*?)\s+=+$")
+    for line in report.splitlines():
+        match = section_pattern.match(line.strip())
+        if match:
+            current = match.group(1).strip()
+            sections.setdefault(current, [])
+            continue
+        if not line.strip() or line.startswith("SYSTEM CONFIGURATION") or line.startswith("Read-only inspection") or line.startswith("[system-config-inspector]"):
+            continue
+        if line.startswith("  "):
+            sections.setdefault(current, []).append({"label": "Environment", "value": line.strip(), "source": "allowlisted environment", "scope": "safe metadata", "confidence": "HIGH", "status": "available"})
+            continue
+        label = line[:34].strip()
+        value = line[34:].strip() if len(line) > 34 else ""
+        if label:
+            final_value = value or UNKNOWN
+            source, scope = metric_source(current, label)
+            sections.setdefault(current, []).append({"label": label, "value": final_value, "source": source, "scope": scope, "confidence": "UNKNOWN" if final_value == UNKNOWN else "MEDIUM", "status": "unavailable" if final_value == UNKNOWN else "available"})
+    flat = {(row["label"]): row["value"] for rows in sections.values() for row in rows if row["label"] != "Environment"}
+    return {"generated_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "report": report, "sections": sections, "flat": flat}
+
+
+def metric_source(section_name: str, label: str) -> tuple[str, str]:
+    if label.startswith("Allocated") or "allocation" in label.lower() or "quota" in label.lower() or "cgroup" in label.lower() or "PID limit" in label:
+        return "cgroup", "allocated/enforced"
+    if section_name == "MEMORY" or label in {"Visible logical CPUs", "CPU model", "Host-visible memory"}:
+        return "/proc and /sys", "visible runtime"
+    if section_name == "RESOURCE LIMITS":
+        return "Python resource", "process limit"
+    if section_name == "PLATFORM":
+        return "explicit environment", "provider evidence"
+    return "runtime inspection", "detected"
+
+
+def dashboard_value(result: dict[str, Any], label: str) -> str:
+    return result.get("flat", {}).get(label, UNKNOWN)
+
+
+def progress_percent(result: dict[str, Any], used_label: str, total_label: str) -> int | None:
+    def raw_bytes(text: str) -> int | None:
+        match = re.search(r"\(([0-9,]+) bytes\)", text)
+        return parse_int(match.group(1).replace(",", "")) if match else None
+    used = raw_bytes(dashboard_value(result, used_label))
+    total = raw_bytes(dashboard_value(result, total_label))
+    if used is None or total is None or total <= 0 or used > total:
+        return None
+    return min(100, max(0, round(used * 100 / total)))
+
+
+def dashboard_html(result: dict[str, Any]) -> str:
+    sections = result.get("sections", {})
+    flat = result.get("flat", {})
+    escaped = lambda value: html.escape(str(value), quote=True)
+    platform_value = flat.get("Detected platform", UNKNOWN)
+    container_value = flat.get("Container", flat.get("Container detected", UNKNOWN))
+    architecture = flat.get("Machine architecture", flat.get("CPU architecture", UNKNOWN))
+    cards = (
+        ("Allocated CPU", flat.get("Allocated CPU", UNKNOWN), "cgroup", "allocated/enforced"),
+        ("Memory allocation / limit", flat.get("Memory allocation / limit", UNKNOWN), "cgroup", "allocated/enforced"),
+        ("Visible storage", flat.get("Visible root filesystem total", UNKNOWN), "disk usage", "visible filesystem"),
+        ("PID allocation / limit", flat.get("PID allocation / limit", flat.get("PID limit", UNKNOWN)), "cgroup", "allocated/enforced"),
+        ("Platform", platform_value, "explicit environment", "provider evidence"),
+        ("Container", container_value, "runtime evidence", "container status"),
+        ("Architecture", architecture, "platform", "visible runtime"),
+        ("Kernel", flat.get("Kernel release", flat.get("Kernel version", UNKNOWN)), "platform", "visible runtime"),
+    )
+    card_html = "".join(f'<article class="summary-card"><div class="eyebrow">{escaped(title)}</div><div class="summary-value">{escaped(value)}</div><div class="source">Source: {escaped(source)} · Scope: {escaped(scope)}</div></article>' for title, value, source, scope in cards)
+    memory_progress = progress_percent(result, "Used visible memory", "Host-visible memory")
+    progress_html = f'<div class="progress"><span style="width:{memory_progress}%"></span></div><div class="progress-label">Visible memory usage: {memory_progress}%</div>' if memory_progress is not None else ""
+    sections_html = []
+    for section_name, rows in sections.items():
+        if section_name == "REPORT":
+            continue
+        row_html = []
+        for row in rows:
+            label, value = row["label"], row["value"]
+            source, scope = metric_source(section_name, label)
+            row_html.append(f'<tr><th>{escaped(label)}</th><td><code>{escaped(value)}</code><small>Source: {escaped(source)} · Scope: {escaped(scope)}</small></td></tr>')
+        body = "".join(row_html) or f'<tr><td colspan="2">{escaped(UNKNOWN)}</td></tr>'
+        sections_html.append(f'<details class="panel" open><summary>{escaped(section_name)}<span>{len(rows)} metrics</span></summary><table><tbody>{body}</tbody></table></details>')
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>System Config Inspector</title><style>
+:root{{--bg:#0b1220;--panel:#111c2e;--panel2:#17253a;--text:#e7eef8;--muted:#94a8c2;--line:#263952;--accent:#54d6b0;--warn:#f5c26b;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}}*{{box-sizing:border-box}}body{{margin:0;background:linear-gradient(135deg,#0b1220,#101b2e 60%,#0b1624);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}}main{{max-width:1500px;margin:auto;padding:28px 20px 60px}}header{{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:26px}}h1{{font-size:clamp(1.6rem,3vw,2.5rem);margin:0 0 8px;letter-spacing:-.03em}}.subtitle{{color:var(--muted);margin:0}}.badges{{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}}.badge{{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:7px 11px;color:var(--accent);font:12px var(--mono)}}.summary-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:22px}}.summary-card,.panel{{background:rgba(17,28,46,.9);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 30px #0002}}.summary-card{{padding:17px;min-height:126px}}.eyebrow{{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}}.summary-value{{font-size:1.25rem;font-weight:700;margin:12px 0 9px;overflow-wrap:anywhere}}.source,small{{color:var(--muted);font-size:.72rem;line-height:1.45}}.intro,.note{{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;color:var(--muted);margin-bottom:18px}}.panel{{margin:12px 0;overflow:hidden}}summary{{cursor:pointer;padding:16px 18px;font-weight:750;letter-spacing:.06em;color:var(--accent);display:flex;justify-content:space-between;gap:12px}}summary span{{font:12px var(--mono);color:var(--muted);letter-spacing:0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:11px 16px;border-top:1px solid var(--line);text-align:left;vertical-align:top}}th{{width:31%;color:#c6d6ea;font-weight:600}}td code{{font:13px/1.5 var(--mono);color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}}td small{{display:block;margin-top:4px}}.progress{{height:8px;background:#263952;border-radius:99px;overflow:hidden;margin:12px 0 4px}}.progress span{{display:block;height:100%;background:linear-gradient(90deg,var(--accent),#7de0ff);border-radius:99px}}.progress-label{{color:var(--muted);font:12px var(--mono)}}@media(max-width:700px){{main{{padding:20px 12px 40px}}header{{display:block}}.badges{{justify-content:flex-start;margin-top:16px}}th{{width:40%}}th,td{{padding:10px 9px}}}}
+</style></head><body><main><header><div><h1>System Config Inspector</h1><p class="subtitle">Read-only environment inspection · standard-library dashboard</p></div><div class="badges"><span class="badge">{escaped(platform_value)}</span><span class="badge">{escaped(architecture)}</span><span class="badge">{escaped(container_value)}</span></div></header><section class="overview"><h2>OVERVIEW</h2><div class="intro">Latest inspection: <code>{escaped(result.get("generated_at", UNKNOWN))}</code>. The dashboard is rendered from the same immutable inspection result printed to the CLI. No external resources or network calls are used.</div></section><section class="summary-grid">{card_html}</section><section class="note"><strong>Resource distinction:</strong> host-visible hardware and filesystem capacity are not the same as cgroup-enforced allocation. Each metric includes its source and scope. {progress_html}</section>{''.join(sections_html)}</main></body></html>'''
+
+
 class QuietReportHandler(http.server.BaseHTTPRequestHandler):
-    """Serve the immutable startup report and a minimal health response."""
+    """Serve the immutable shared inspection result and health response."""
 
     report = ""
+    dashboard = ""
 
     def _send(self, status: int, body: str, content_type: str = "text/plain; charset=utf-8") -> None:
         payload = body.encode("utf-8")
@@ -867,7 +959,7 @@ class QuietReportHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path == "/":
-            self._send(200, self.report)
+            self._send(200, self.dashboard, "text/html; charset=utf-8")
         elif path == "/healthz":
             self._send(200, "ok\n")
         else:
@@ -904,8 +996,9 @@ def parse_port() -> int:
     return 10000
 
 
-def serve_report(report: str, port: int) -> None:
-    QuietReportHandler.report = report
+def serve_report(result: dict[str, Any], port: int) -> None:
+    QuietReportHandler.report = result.get("report", "")
+    QuietReportHandler.dashboard = dashboard_html(result)
     server = InspectorHTTPServer(("0.0.0.0", port), QuietReportHandler)
     stopping = {"value": False}
 
@@ -925,16 +1018,31 @@ def serve_report(report: str, port: int) -> None:
         print("[system-config-inspector] HTTP server stopped.", flush=True)
 
 
+def selected_mode() -> str:
+    mode = os.environ.get("INSPECTOR_MODE", "serve").strip().lower()
+    for argument in sys.argv[1:]:
+        if argument == "--once":
+            mode = "once"
+        elif argument == "--serve":
+            mode = "serve"
+    return mode if mode in {"once", "serve"} else "serve"
+
+
 def main() -> int:
     try:
-        print("[system-config-inspector] Starting read-only runtime inspection...", flush=True)
+        mode = selected_mode()
+        if mode == "serve":
+            print("[system-config-inspector] Starting read-only runtime inspection...", flush=True)
         report = build_inspection_report()
         completed_report = report + "\n[system-config-inspector] Inspection completed successfully.\n"
+        result = parse_report(completed_report)
         print(completed_report, end="", flush=True)
-        serve_report(completed_report, parse_port())
+        if mode == "once":
+            return 0
+        serve_report(result, parse_port())
         return 0
     except KeyboardInterrupt:
-        print("\\n[system-config-inspector] Inspection interrupted; shutting down.", file=sys.stderr)
+        print("\n[system-config-inspector] Inspection interrupted; shutting down.", file=sys.stderr)
         return 130
     except Exception as exc:
         print(f"[system-config-inspector] Fatal application failure: {exc}", file=sys.stderr)
