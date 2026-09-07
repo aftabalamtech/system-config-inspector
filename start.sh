@@ -10,7 +10,7 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 if [[ "${INSPECTOR_MODE:-serve}" == "once" ]]; then
-  exec python3 "$SCRIPT_DIR/network_details.py" --once
+  exec python3 "$SCRIPT_DIR/system_info.py" --once
 else
-  exec python3 "$SCRIPT_DIR/network_details.py" --serve
+  exec python3 "$SCRIPT_DIR/system_info.py" --serve
 fi
