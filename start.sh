@@ -3,9 +3,9 @@ set -u
 
 printf '%s\n' "[system-config-inspector] Starting read-only runtime inspection..."
 if [[ -n "${PORT:-}" ]]; then
-  printf '%s\n' "[system-config-inspector] PORT=${PORT} detected; the HTTP viewer will bind to 0.0.0.0."
+  printf '%s\n' "[system-config-inspector] PORT=${PORT} detected; plain-text report will be served on 0.0.0.0:${PORT}."
 else
-  printf '%s\n' "[system-config-inspector] PORT is not set; the HTTP viewer will use fallback port 10000."
+  printf '%s\n' "[system-config-inspector] PORT is not set; plain-text report will use fallback port 10000."
 fi
 
 if [[ "${INSPECTOR_MODE:-serve}" == "once" ]]; then
